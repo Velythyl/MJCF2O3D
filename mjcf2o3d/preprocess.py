@@ -58,6 +58,10 @@ def remove_skylights_skyboxes_floors(mjcf_file, output_file):
     tree.write(output_file)
     print(f"Modified MJCF saved to {output_file}")
 
+def replace_material_by_id(mjcf_file, output_file):
+    # todo assign a colour to each geom
+    pass
+
 def generate_cameras_on_sphere(center, distance, num_cameras=8):
     """
     Generate cameras evenly spaced on a sphere around a center point.
@@ -108,6 +112,8 @@ def generate_cameras_on_sphere(center, distance, num_cameras=8):
         })
 
     return cameras
+
+
 
 
 def add_cameras_to_mjcf(mjcf_file, output_file, center, root_name, distance, num_cameras=8):
