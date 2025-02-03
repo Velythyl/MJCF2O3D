@@ -60,26 +60,14 @@ def main_isolate(mjcf_file):
     def is_closer_to_white(pcd_colours):
         return np.all(pcd_colours != np.array([0,0,0]), axis=1)
 
-        # Define white and black colors in RGB
-        white = np.array([1.0, 1.0, 1.0])  # Assuming colors are normalized to [0, 1]
-        black = np.array([0.0, 0.0, 0.0])
-
-        # Calculate the Euclidean distance to white and black
-        dist_to_white = np.linalg.norm(pcd_colours - white, axis=1)
-        dist_to_black = np.linalg.norm(pcd_colours - black, axis=1)
-
-        # Create a mask where True indicates the color is closer to white than black
-        mask = dist_to_white < dist_to_black
-
-        return mask
 
     _, actuator_colors = handle_actuator(intermediate_file, actuator_names[0])
 
-    #actuator_to_pcd = {}
     rebuild_pcd_points = []
     rebuild_pcd_colours = []
-    for actuator in actuator_names:
-        file_with_isolated_actuator, _ = handle_actuator(intermediate_file, [actuator])
+
+    def handle_actuator_list(actuator_name_list, replace_by_colour, flip_mask):
+        file_with_isolated_actuator, _ = handle_actuator(intermediate_file, actuator_name_list)
 
         pcd, _ = scanfile(mjcf_file, file_with_isolated_actuator, root_position, num_cameras, camera_distance)
 
@@ -87,41 +75,39 @@ def main_isolate(mjcf_file):
         pcd_colours = np.asarray(pcd.colors)
 
         isolated_actuator_colour_mask = is_closer_to_white(pcd_colours)
+        if flip_mask:
+            isolated_actuator_colour_mask = np.logical_not(isolated_actuator_colour_mask)
 
-        actuator_specific_colour = np.full_like(pcd_colours[isolated_actuator_colour_mask], actuator_colors[actuator])
+        actuator_specific_colour = np.full_like(pcd_colours[isolated_actuator_colour_mask],
+                                                replace_by_colour)
 
         rebuild_pcd_points.append(pcd_points[isolated_actuator_colour_mask])
         rebuild_pcd_colours.append(actuator_specific_colour)
 
-    file_with_isolated_body, _ = handle_actuator(intermediate_file, actuator_names)
-    pcd, _ = scanfile(mjcf_file, file_with_isolated_body, root_position, num_cameras, camera_distance)
-    pcd_points = np.asarray(pcd.points)
-    pcd_colours = np.asarray(pcd.colors)
-    isolated_actuator_colour_mask = is_closer_to_white(pcd_colours)
-    isolated_actuator_colour_mask = np.logical_not(isolated_actuator_colour_mask)
-    actuator_specific_colour = np.full_like(pcd_colours[isolated_actuator_colour_mask], (0,0,0))
-    rebuild_pcd_points.append(pcd_points[isolated_actuator_colour_mask])
-    rebuild_pcd_colours.append(actuator_specific_colour)
-
-        #actuator_to_pcd[actuator] = (pcd_points[isolated_actuator_colour_mask], actuator_specific_colour)
-
+    rebuild_pcd_points = []
+    rebuild_pcd_colours = []
+    for actuator_name in actuator_names:
+        handle_actuator_list([actuator_name], actuator_colors[actuator_name], False)
+    # GRABS THE REST OF THE BODIES
+    handle_actuator_list(actuator_names, (0,0,0), True)
     pcd_points = np.concatenate(rebuild_pcd_points)
     pcd_colours = np.concatenate(rebuild_pcd_colours)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pcd_points)
-    pcd.colors = o3d.utility.Vector3dVector(pcd_colours)
+    def pc_to_pcd(p, c):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(p)
+        pcd.colors = o3d.utility.Vector3dVector(c)
+        return pcd
 
-    # now, we cleanup the cloud
+    print("Cleaning up point cloud for in-geometry bad data")
 
     # Build a KDTree for nearest neighbor search
+    pcd = pc_to_pcd(pcd_points, pcd_colours)
     pcd_tree = o3d.geometry.KDTreeFlann(pcd)
 
     # List to store indices of points to be removed
     indices_to_remove = []
-
     # Iterate through each point in the point cloud
-    print("Cleaning up point cloud for in-geometry bad data")
     for i in tqdm(range(len(pcd.points))):
         # Find the 10 nearest neighbors
         [k, idx, _] = pcd_tree.search_knn_vector_3d(pcd.points[i], 10)
@@ -140,21 +126,20 @@ def main_isolate(mjcf_file):
         if same_color_count < 5:  # You can adjust this threshold
             indices_to_remove.append(i)
 
+    def pc_mask(p, c, indices_to_remove):
+        # Remove the points marked for removal
+        mask = np.ones(pcd_points.shape[0])
+        for i in indices_to_remove:
+            mask[i] = 0
+        mask = mask.astype(bool)
+
+        return p[mask], c[mask]
+
     # Remove the points marked for removal
-    mask = np.ones(pcd_points.shape[0])
-    for i in indices_to_remove:
-        mask[i] = 0
-    mask = mask.astype(bool)
-
-    pcd_points = pcd_points[mask]
-    pcd_colours = pcd_colours[mask]
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pcd_points)
-    pcd.colors = o3d.utility.Vector3dVector(pcd_colours)
+    pcd_points, pcd_colours = pc_mask(pcd_points, pcd_colours, indices_to_remove)
 
     print("Cleaning up point cloud for floating points")
-
+    pcd = pc_to_pcd(pcd_points, pcd_colours)
     # Build a KDTree for nearest neighbor search
     pcd_tree = o3d.geometry.KDTreeFlann(pcd)
 
@@ -185,17 +170,9 @@ def main_isolate(mjcf_file):
     # Identify outliers (points with average distance > mean + std_dev_threshold * std_dev)
     outlier_indices = np.where(avg_distances > mean_distance + std_dev_threshold * std_dev_distance)[0]
 
-    #pcd.remove_points_by_index(indices_to_remove)
-    mask = np.ones(pcd_points.shape[0])
-    for i in outlier_indices:
-        mask[i] = 0
-    mask = mask.astype(bool)
-    pcd_points = pcd_points[mask]
-    pcd_colours = pcd_colours[mask]
+    pcd_points, pcd_colours = pc_mask(pcd_points, pcd_colours, outlier_indices)
 
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pcd_points)
-    pcd.colors = o3d.utility.Vector3dVector(pcd_colours)
+    pcd = pc_to_pcd(pcd_points, pcd_colours)
 
     return pcd, actuator_colors
 
