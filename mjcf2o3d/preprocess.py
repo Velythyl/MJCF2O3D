@@ -37,14 +37,7 @@ def remove_skylights_skyboxes_floors(mjcf_file, output_file):
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
 
-    # Find all <include> elements
-    includes = root.findall(".//include")
 
-    # Remove each <include> element
-    for include in includes:
-        parent = include.getparent()
-        if parent is not None:
-            parent.remove(include)
 
     # Remove skylights, skyboxes, and floors
     for elem in root.findall(".//light[@name='skylight']"):
@@ -72,6 +65,15 @@ def remove_visual_noise(mjcf_file, output_file):
     # Parse the MJCF file
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
+
+    # Find all <include> elements
+    includes = root.findall(".//include")
+
+    # Remove each <include> element
+    for include in includes:
+        parent = include.getparent()
+        if parent is not None:
+            parent.remove(include)
 
     # Configure visual settings properly
     visual = root.find(".//visual")
@@ -105,10 +107,23 @@ def remove_visual_noise(mjcf_file, output_file):
     tree.write(output_file)
     print(f"Modified MJCF saved to {output_file}")
 
-
-def identify_actuator(mjcf_file, output_file):
+def get_actuator_names(mjcf_file):
     # Parse the MJCF file
-    import colorsys
+    tree = etree.parse(mjcf_file)
+    root = tree.getroot()
+
+    # Find all actuator elements
+    actuator_elements = root.findall(".//actuator/*")
+    actuators = []
+    for elem in actuator_elements:
+        actuator_name = elem.get('name')
+        actuators.append(actuator_name)
+    return actuators
+
+
+import colorsys
+def identify_actuator(mjcf_file, output_file, isolate_actuator_names):
+    # Parse the MJCF file
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
 
@@ -166,43 +181,20 @@ def identify_actuator(mjcf_file, output_file):
     # Sort by depth (shallowest first) to process parent bodies first
     actuator_info.sort(key=lambda x: x[0])
 
-    genned_colours = [np.array([0, 0, 0, 255])]
-
-    def get_random_colour(i, num_actuators):
-        np.random.seed(i + num_actuators)
-
-        for _ in range(1000):
-            ret = np.random.randint(0, 255, size=(4))
-            ret[-1] = 255  # Ensure full opacity
-
-            valid = True
-            for genned_colour in genned_colours:
-                if np.all(np.abs(ret[:-1] - genned_colour[:-1]) < 2):  # Check R, G, B
-                    valid = False
-                    break
-
-            if valid:
-                genned_colours.append(ret)
-                return tuple(ret.astype(float) / 255)
-        raise AssertionError("Could not find a valid colour")
-
     # Generate distinct colors for each actuator
     num_actuators = len(actuator_info)
     actuator_colors = {}
     for i, (depth, actuator_name, joint_name, geoms) in enumerate(actuator_info):
         hue = i / num_actuators  # Vary hue from 0 to 1
-        #hue  = hue / 2
-        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)  # Full saturation and value
-        #colorsys.hsv_to_rgb(hue, 1.0, 1.0)  # Full saturation and value
-        rgba = (r, g, b, 1.0)  # Alpha set to 1.0
-        #rgba = (0.5, 0.0, 1.0, 1.0)
-        #if i < 3:
-        #    rgba = (1.0, 0.0, 0.75, 1.0)
-        rgba = get_random_colour(i, num_actuators)
-        actuator_colors[actuator_name] = rgba
 
-        # Apply color to all geoms in this actuator's hierarchy
-        rgba_str = ' '.join(f"{c:.3f}" for c in rgba)
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, 1.0)  # Full saturation and value
+
+        actuator_colors[actuator_name] = (r,g,b)
+
+        if actuator_name in isolate_actuator_names:
+            rgba_str = "1 1 1 1"
+        else:
+            rgba_str = "0 0 0 1"
         for geom in geoms:
             geom.set('rgba', rgba_str)
 
@@ -405,6 +397,7 @@ def _get_robot_bounding_box(model, mjcf_file):
 
     return {'min': min_bound, 'max': max_bound}
 
+
 def preprocess(mjcf_file, num_cameras=8, isolate_actuators=False):
     root_position, root_name = extract_root_position_and_name(mjcf_file)
 
@@ -418,16 +411,17 @@ def preprocess(mjcf_file, num_cameras=8, isolate_actuators=False):
     file_no_planes= get_temp_filepath()
     remove_skylights_skyboxes_floors(mjcf_file, file_no_planes)
 
-    workfile = file_no_planes
-    actuator_colors = {}
-    if isolate_actuators:
-        file_no_objects = get_temp_filepath()
-        remove_visual_noise(file_no_planes, file_no_objects)
-
-        identified_actuators = get_temp_filepath()
-        actuator_colors = identify_actuator(file_no_objects, identified_actuators)
-        workfile = identified_actuators
-
     output_file = get_temp_filepath()
-    add_cameras_to_mjcf(workfile, output_file, root_position, root_name, camera_distance, isolate_actuators=isolate_actuators, num_cameras=num_cameras)
-    return output_file, num_cameras + 6, camera_distance, root_position, actuator_colors
+    add_cameras_to_mjcf(file_no_planes, output_file, root_position, root_name, camera_distance,
+                        isolate_actuators=False, num_cameras=num_cameras)
+    return output_file, num_cameras+6, camera_distance, root_position
+
+def handle_actuator(workfile, actuator_names):
+
+    file_no_objects = get_temp_filepath()
+    remove_visual_noise(workfile, file_no_objects)
+
+    identified_actuators = get_temp_filepath()
+    actuator_colours = identify_actuator(file_no_objects, identified_actuators, actuator_names)
+
+    return identified_actuators, actuator_colours

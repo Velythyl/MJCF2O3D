@@ -12,6 +12,12 @@ That's it!
 
 ![Image of the scanning process](./assets/pcd.png)
 
+# As a dataset creator
+
+This repo can also isolate the geoms actuated by, uh, actuators.
+
+![img.png](assets/img.png)
+
 ### Acknowledgements
 
 Thanks to [RoCo](https://github.com/MandiZhao/robot-collab) for the DM Control pointcloud creation logic.
