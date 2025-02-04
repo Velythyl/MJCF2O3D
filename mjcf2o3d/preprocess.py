@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import lxml.etree as etree
 
 import mujoco
@@ -61,7 +63,7 @@ def remove_skylights_skyboxes_floors(mjcf_file, output_file):
     tree.write(output_file)
     print(f"Modified MJCF saved to {output_file}")
 
-def remove_visual_noise(mjcf_file, output_file):
+def remove_visual_noise(mjcf_file, output_file, rest_of_body_colour):
     # Parse the MJCF file
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
@@ -93,7 +95,7 @@ def remove_visual_noise(mjcf_file, output_file):
         'specular': '1',
         'shininess': '1',
         'reflectance': '1',
-        'rgba': "0 0 0 1"
+        'rgba': rest_of_body_colour
 
     })
     asset.append(flat_material)
@@ -106,6 +108,30 @@ def remove_visual_noise(mjcf_file, output_file):
     # Save the modified MJCF
     tree.write(output_file)
     print(f"Modified MJCF saved to {output_file}")
+
+
+def generate_actuator_names(mjcf_file, output_file):
+    # Parse the MJCF file
+    tree = etree.parse(mjcf_file)
+    root = tree.getroot()
+
+    actuators = root.findall(".//actuator/*")
+    name_counts = {}
+
+    for actuator in actuators:
+        if "name" not in actuator.attrib:
+            joint = actuator.get("joint", "unnamed_joint")
+            base_name = f"act_{joint}"
+
+            # Ensure uniqueness
+            count = name_counts.get(base_name, 0)
+            new_name = base_name if count == 0 else f"{base_name}_{count}"
+            name_counts[base_name] = count + 1
+
+            actuator.set("name", new_name)
+
+    tree.write(output_file)
+    print(f"Modified MJCF with asserted actuator names saved to {output_file}")
 
 def get_actuator_names(mjcf_file):
     # Parse the MJCF file
@@ -120,9 +146,38 @@ def get_actuator_names(mjcf_file):
         actuators.append(actuator_name)
     return actuators
 
+def remove_overlaps(mjcf_file):
+    model = mujoco.MjModel.from_xml_path(mjcf_file)
+    data = mujoco.MjData(model)
+
+    def is_overlapping(model, data):
+        """Returns True if there are overlapping bodies."""
+        mujoco.mj_forward(model, data)  # Update physics
+        for i in range(model.nbody):
+            for j in range(i + 1, model.nbody):
+                if model.geom_pair[(i, j)]:  # Check if collision is enabled
+                    dist = np.linalg.norm(data.xpos[i] - data.xpos[j])
+                    if dist < (model.geom_size[i, 0] + model.geom_size[j, 0]):  # Check radius overlap
+                        return True
+        return False
+
+    def spread_out_bodies(model, data, spread_factor=2.0):
+        """Moves bodies apart until there are no overlaps."""
+        for i in range(model.nbody):
+            data.qpos[3 * i: 3 * i + 3] = np.random.uniform(-spread_factor, spread_factor, size=3)
+
+        mujoco.mj_forward(model, data)
+        while is_overlapping(model, data):
+            for i in range(model.nbody):
+                data.qpos[3 * i: 3 * i + 3] += np.random.uniform(-0.1, 0.1, size=3)  # Small random moves
+            mujoco.mj_forward(model, data)
+
+    if is_overlapping(model, data):
+        spread_out_bodies(model, data)
+
 
 import colorsys
-def identify_actuator(mjcf_file, output_file, isolate_actuator_names):
+def identify_actuator(mjcf_file, output_file, isolate_actuator_names, removed_actuator_colour, kept_actuator_colour):
     # Parse the MJCF file
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
@@ -192,15 +247,15 @@ def identify_actuator(mjcf_file, output_file, isolate_actuator_names):
         actuator_colors[actuator_name] = (r,g,b)
 
         if actuator_name in isolate_actuator_names:
-            rgba_str = "1 1 1 1"
+            rgba_str = kept_actuator_colour
         else:
-            rgba_str = "0 0 0 1"
+            rgba_str = removed_actuator_colour
         for geom in geoms:
             geom.set('rgba', rgba_str)
 
     # Save the modified MJCF to a new file
     tree.write(output_file)
-    print(f"Actuator-colored MJCF saved to {output_file}")
+    print(f"Actuator-colored MJCF for {isolate_actuator_names} saved to {output_file}")
     return actuator_colors
 
 def generate_cameras_on_sphere(center, distance, num_cameras=8):
@@ -397,16 +452,42 @@ def _get_robot_bounding_box(model, mjcf_file):
 
     return {'min': min_bound, 'max': max_bound}
 
+def model_convert_mujoco233(mjcf_file):
+    import subprocess
+    path = "/".join(__file__.split("/")[:-1])
+
+    new_filename = get_temp_filepath()
+    subprocess.run('PYTHONPATH="${PYTHONPATH}:' + f'{path}" ' + f'{path}/../venv_mujoco233/bin/python -c "import mujoco233_convert; mujoco233_convert._model_convert_mujoco233(\'{mjcf_file}\', \'{new_filename}\')"', shell=True, check=True)
+    return new_filename
+
 
 def preprocess(mjcf_file, num_cameras=8, isolate_actuators=False):
     root_position, root_name = extract_root_position_and_name(mjcf_file)
 
     # Compute bounding box
-    model = mujoco.MjModel.from_xml_path(mjcf_file)
+    def try_load_xml(mjcf_file):
+        try:
+            return mjcf_file, mujoco.MjModel.from_xml_path(mjcf_file)
+        except ValueError:
+            pass
+        except Exception as e:
+            raise Exception
+
+        mjcf_file = model_convert_mujoco233(mjcf_file)
+        model = mujoco.MjModel.from_xml_path(mjcf_file)
+        return mjcf_file, model
+
+    mjcf_file, model = try_load_xml(mjcf_file)
     bounding_box = _get_robot_bounding_box(model, mjcf_file)
     size = bounding_box['max'] - bounding_box['min']
     diagonal = np.linalg.norm(size)
     camera_distance = diagonal * 3.0
+
+    #remove_overlaps(mjcf_file)
+
+    mjcf_file_with_actuators = get_temp_filepath()
+    generate_actuator_names(mjcf_file, mjcf_file_with_actuators)
+    mjcf_file = mjcf_file_with_actuators
 
     file_no_planes= get_temp_filepath()
     remove_skylights_skyboxes_floors(mjcf_file, file_no_planes)
@@ -416,12 +497,26 @@ def preprocess(mjcf_file, num_cameras=8, isolate_actuators=False):
                         isolate_actuators=False, num_cameras=num_cameras)
     return output_file, num_cameras+6, camera_distance, root_position
 
-def handle_actuator(workfile, actuator_names):
+def handle_actuator(workfile, actuator_names, rest_of_body_colour="t", removed_actuator_colour="t", kept_actuator_colour="w"):
+
+    def marshall_colour(colour):
+        colour = colour.lower()
+        if colour in ["t", "transparent"]:
+            return "0 0 0 0"
+        if colour in ["w", "white"]:
+            return "1 1 1 1"
+        if colour in ["b", "black"]:
+            return "0 0 0 1"
+        return colour
+
+    rest_of_body_colour = marshall_colour(rest_of_body_colour)
+    removed_actuator_colour = marshall_colour(removed_actuator_colour)
+    kept_actuator_colour = marshall_colour(kept_actuator_colour)
 
     file_no_objects = get_temp_filepath()
-    remove_visual_noise(workfile, file_no_objects)
+    remove_visual_noise(workfile, file_no_objects, rest_of_body_colour)
 
     identified_actuators = get_temp_filepath()
-    actuator_colours = identify_actuator(file_no_objects, identified_actuators, actuator_names)
+    actuator_colours = identify_actuator(file_no_objects, identified_actuators, actuator_names, removed_actuator_colour, kept_actuator_colour)
 
     return identified_actuators, actuator_colours

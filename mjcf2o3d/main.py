@@ -3,11 +3,14 @@ import gc
 import json
 import os
 import shutil
+import sys
 
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
-from mjcf2o3d.file_utils import get_temp_filename
+from mjcf2o3d.file_utils import get_temp_filename, get_temp_filepath
+from mjcf2o3d.pointcloud import pc_to_pcd, pc_cleanup_distance_outliers
 from mjcf2o3d.preprocess import preprocess, get_actuator_names, handle_actuator
 from mjcf2o3d.scanner.dm_control_scan import scan
 
@@ -49,143 +52,84 @@ def main_no_isolate(mjcf_file):
                                                                                                  isolate_actuators=False)
     return scanfile(mjcf_file, intermediate_file, root_position, num_cameras, camera_distance)
 
-def main_isolate(mjcf_file):
+def main_isolate(mjcf_file, fullscan_gif_file):
     num_cameras = 32
     intermediate_file, num_cameras, camera_distance, root_position = preprocess(mjcf_file,
                                                                                                  num_cameras=num_cameras,
                                                                                                  isolate_actuators=True)
 
-    actuator_names = get_actuator_names(mjcf_file)
+    actuator_names = get_actuator_names(intermediate_file)
 
     def is_closer_to_white(pcd_colours):
         return np.all(pcd_colours != np.array([0,0,0]), axis=1)
 
 
-    _, actuator_colors = handle_actuator(intermediate_file, actuator_names[0])
+    _, actuator_colors = handle_actuator(intermediate_file, [actuator_names[0]])
 
     rebuild_pcd_points = []
     rebuild_pcd_colours = []
+    gif_files = [fullscan_gif_file]
 
-    def handle_actuator_list(actuator_name_list, replace_by_colour, flip_mask):
-        file_with_isolated_actuator, _ = handle_actuator(intermediate_file, actuator_name_list)
+    def handle_actuator_list(actuator_name_list, replace_by_colour, rest_of_body="t", kept_actuators="w"):
+        file_with_isolated_actuator, _ = handle_actuator(intermediate_file, actuator_name_list, rest_of_body, "t", kept_actuators)
 
-        pcd, _ = scanfile(mjcf_file, file_with_isolated_actuator, root_position, num_cameras, camera_distance)
+        pcd, giffile = scanfile(mjcf_file, file_with_isolated_actuator, root_position, num_cameras, camera_distance)
 
         pcd_points = np.asarray(pcd.points)
+        pcd_points = pcd_points + np.random.normal(loc=0.0, scale=0.001, size=pcd_points.shape)
         pcd_colours = np.asarray(pcd.colors)
 
         isolated_actuator_colour_mask = is_closer_to_white(pcd_colours)
-        if flip_mask:
-            isolated_actuator_colour_mask = np.logical_not(isolated_actuator_colour_mask)
 
         actuator_specific_colour = np.full_like(pcd_colours[isolated_actuator_colour_mask],
                                                 replace_by_colour)
 
         rebuild_pcd_points.append(pcd_points[isolated_actuator_colour_mask])
         rebuild_pcd_colours.append(actuator_specific_colour)
+        gif_files.append(giffile)
 
-    rebuild_pcd_points = []
-    rebuild_pcd_colours = []
     for actuator_name in actuator_names:
-        handle_actuator_list([actuator_name], actuator_colors[actuator_name], False)
+        handle_actuator_list([actuator_name], actuator_colors[actuator_name])
     # GRABS THE REST OF THE BODIES
-    handle_actuator_list(actuator_names, (0,0,0), True)
-    pcd_points = np.concatenate(rebuild_pcd_points)
-    pcd_colours = np.concatenate(rebuild_pcd_colours)
+    handle_actuator_list(actuator_names, (0,0,0), "w", "t")
+    actuator_names.append(">NO_ACTUATORS<")
+    actuator_colors[actuator_names[-1]] = (0,0,0)
 
-    def pc_to_pcd(p, c):
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(p)
-        pcd.colors = o3d.utility.Vector3dVector(c)
-        return pcd
+    def handle_gifs():
+        # Open images and store them in a list
+        frames = [Image.open(gif) for gif in gif_files]
+        # Save as animated GIF
+        image_path = f"{get_temp_filepath('.gif')}"
+        frames[0].save(image_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        return image_path
 
-    print("Cleaning up point cloud for in-geometry bad data")
+    new_image_path = handle_gifs()
 
-    # Build a KDTree for nearest neighbor search
-    pcd = pc_to_pcd(pcd_points, pcd_colours)
-    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
+    cleaned_pcd_points, cleaned_pcd_colours = [], []
+    for p,c in zip(rebuild_pcd_points, rebuild_pcd_colours):
+        p, c, _ = pc_cleanup_distance_outliers(p, c)
+        cleaned_pcd_points.append(p)
+        cleaned_pcd_colours.append(c)
 
-    # List to store indices of points to be removed
-    N_KNN = 3
-    indices_to_remove = []
-    # Iterate through each point in the point cloud
-    for i in tqdm(range(len(pcd.points))):
-        # Find the 10 nearest neighbors
-        [k, idx, _] = pcd_tree.search_knn_vector_3d(pcd.points[i], N_KNN)
+    pcd_points, pcd_colours = np.concatenate(cleaned_pcd_points), np.concatenate(cleaned_pcd_colours)
+    _, _, (_, std_distances) = pc_cleanup_distance_outliers(pcd_points, pcd_colours)
+    pcd_points = pcd_points + np.random.normal(loc=0.0, scale=std_distances / 100, size=pcd_points.shape)
 
-        # Get the color of the current point
-        current_color = np.asarray(pcd.colors)[i]
-
-        # Check the colors of the neighbors
-        same_color_count = np.all(current_color == np.asarray(pcd.colors)[idx], axis=1).sum()
-
-        # If fewer than a certain number of neighbors have the same color, mark for removal
-        if same_color_count < N_KNN:  # You can adjust this threshold
-            indices_to_remove.append(i)
-
-    def pc_mask(p, c, indices_to_remove):
-        # Remove the points marked for removal
-        mask = np.ones(pcd_points.shape[0])
-        for i in indices_to_remove:
-            mask[i] = 0
-        mask = mask.astype(bool)
-
-        return p[mask], c[mask]
-
-    # Remove the points marked for removal
-    pcd_points, pcd_colours = pc_mask(pcd_points, pcd_colours, indices_to_remove)
-
-    print("Cleaning up point cloud for floating points")
-    pcd = pc_to_pcd(pcd_points, pcd_colours)
-    # Build a KDTree for nearest neighbor search
-    pcd_tree = o3d.geometry.KDTreeFlann(pcd)
-
-    # Parameters
-    k = 10  # Number of neighbors to consider
-    std_dev_threshold = 10.0  # Threshold for outlier detection (in terms of standard deviations)
-
-    # List to store the average distance of each point to its k nearest neighbors
-    avg_distances = []
-
-    # Iterate through each point in the point cloud
-    for i in tqdm(range(len(pcd.points))):
-        # Find the k nearest neighbors
-        [k, idx, _] = pcd_tree.search_knn_vector_3d(pcd.points[i], k)
-
-        # Compute the average distance to the neighbors
-        distances = np.linalg.norm(np.asarray(pcd.points)[idx] - np.asarray(pcd.points)[i], axis=1)
-        avg_distance = np.mean(distances)
-        avg_distances.append(avg_distance)
-
-    # Convert to a numpy array for easier calculations
-    avg_distances = np.array(avg_distances)
-
-    # Compute the mean and standard deviation of the average distances
-    mean_distance = np.mean(avg_distances)
-    std_dev_distance = np.std(avg_distances)
-
-    # Identify outliers (points with average distance > mean + std_dev_threshold * std_dev)
-    outlier_indices = np.where(avg_distances > mean_distance + std_dev_threshold * std_dev_distance)[0]
-
-    pcd_points, pcd_colours = pc_mask(pcd_points, pcd_colours, outlier_indices)
-
-    pcd = pc_to_pcd(pcd_points, pcd_colours)
-
-    actuator_colors[">REST<"] = (0,0,0)
-
-    info_json = {">FULL<": {"color": None, "pcd_points": pcd_points.tolist(), "pcd_colours": pcd_colours.tolist()}}
+    info_json = {">FULL<": {"color": "all", "pcd_points": pcd_points.tolist(), "pcd_colors": pcd_colours.tolist(), "pcd_indices": np.arange(pcd_points.shape[0]).tolist()}}
     for actuator_name, color in actuator_colors.items():
         mask = np.all(pcd_colours == color, axis=1)
+        assert mask.sum() > 0
         info_json[actuator_name] = {
             "color": list(color),
             "pcd_points": pcd_points[mask].tolist(),
-            "pcd_indices": np.arange(pcd_points.shape[0])[mask].tolist()
+            "pcd_indices": np.arange(pcd_points.shape[0])[mask].tolist(),
+            "pcd_colors": pcd_colours[mask].tolist()
         }
 
-    return pcd, info_json
+    return pc_to_pcd(pcd_points, pcd_colours), info_json, new_image_path
 
 
-def mass_main(mjcf_tree, do_visualize, isolate_actuators):
+def mass_main(mjcf_tree, do_visualize, isolate_actuators, log_file=None):
     """
     Traverse a directory tree, find all XML files, and call the `main` function for each XML file.
 
@@ -194,17 +138,46 @@ def mass_main(mjcf_tree, do_visualize, isolate_actuators):
         do_visualize (bool): Whether to visualize the point cloud.
         isolate_actuators (bool): Whether to isolate actuators in the point cloud.
     """
+    # Collect all XML file paths
+    xml_files = []
     for root, _, files in os.walk(mjcf_tree):
         for file in files:
             if file.endswith(".xml"):
-                mjcf_file = os.path.join(root, file)
-                outfile = mjcf_file.replace(".xml", "-parsed.pcd")
-                main(mjcf_file, outfile, do_visualize, isolate_actuators)
+                xml_files.append(os.path.join(root, file))
+
+    if log_file is None:
+        log_file = get_temp_filepath(ext=".txt")
+
+    # Redirect stdout and stderr to log file
+    log_file = open(log_file, "w")
+    print(f"Write mass process log to {log_file}")
+
+    # Process files with tqdm progress bar
+    pbar = tqdm(xml_files, desc="Processing XML files")
+    for mjcf_file in pbar:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = log_file, log_file
+
+        outfile = mjcf_file.replace(".xml", "-parsed.pcd")
+        pbar.set_postfix_str(mjcf_file)
+        try:
+            main(mjcf_file, outfile, do_visualize, isolate_actuators)
+        except Exception as e:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            raise e
+
+        sys.stdout, sys.stderr = old_stdout, old_stderr
+
+    log_file.close()
+    print(f"Wrote log to {log_file}")
 
 def main(mjcf_file, outfile, do_visualize, isolate_actuators):
     pcd, temp_image_path = main_no_isolate(mjcf_file)
+    json_format = {"color": "all", "pcd_points": np.asarray(pcd.points).tolist(), "pcd_colors": np.asarray(pcd.colors).tolist(), "pcd_indices": np.arange(np.asarray(pcd.points).shape[0]).tolist()}
+    json_format = {">ORIGINAL XML<": json_format}
     if isolate_actuators:
-        pcd, actuator_colors = main_isolate(mjcf_file)
+        pcd, new_json_format, temp_image_path = main_isolate(mjcf_file, temp_image_path)
+        json_format.update(new_json_format)
 
 
     # Save the point cloud to the specified outfile
@@ -213,7 +186,7 @@ def main(mjcf_file, outfile, do_visualize, isolate_actuators):
 
     if isolate_actuators:
         json_outfile = outfile.split(".pcd")[0]+".json"
-        jsonstring = json.dumps(actuator_colors) #.replace(", ", ",\n ")
+        jsonstring = json.dumps(json_format) #.replace(", ", ",\n ")
         with open(json_outfile, "w") as f:
             f.write(jsonstring)
         print(f"Saved actuator colours to {outfile}")
@@ -229,6 +202,12 @@ def main(mjcf_file, outfile, do_visualize, isolate_actuators):
 
 
 if __name__ == '__main__':
+    #mass_main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/xmls", do_visualize=False, isolate_actuators=True)
+    #exit()
+
+    main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/xmls/environments/walker_humanoids_hopper_test/walker_6_main.xml", "./pointcloud.pcd", True, True)
+    exit()
+
     parser = argparse.ArgumentParser(
         description="Process MJCF file to generate point cloud and optionally save an image.")
 
