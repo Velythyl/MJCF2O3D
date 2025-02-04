@@ -106,24 +106,21 @@ def main_isolate(mjcf_file):
     pcd_tree = o3d.geometry.KDTreeFlann(pcd)
 
     # List to store indices of points to be removed
+    N_KNN = 3
     indices_to_remove = []
     # Iterate through each point in the point cloud
     for i in tqdm(range(len(pcd.points))):
         # Find the 10 nearest neighbors
-        [k, idx, _] = pcd_tree.search_knn_vector_3d(pcd.points[i], 10)
+        [k, idx, _] = pcd_tree.search_knn_vector_3d(pcd.points[i], N_KNN)
 
         # Get the color of the current point
         current_color = np.asarray(pcd.colors)[i]
 
         # Check the colors of the neighbors
-        same_color_count = 0
-        for neighbor_idx in idx:
-            neighbor_color = np.asarray(pcd.colors)[neighbor_idx]
-            if np.allclose(neighbor_color, current_color, atol=0.1):  # You can adjust the tolerance
-                same_color_count += 1
+        same_color_count = np.all(current_color == np.asarray(pcd.colors)[idx], axis=1).sum()
 
         # If fewer than a certain number of neighbors have the same color, mark for removal
-        if same_color_count < 5:  # You can adjust this threshold
+        if same_color_count < N_KNN:  # You can adjust this threshold
             indices_to_remove.append(i)
 
     def pc_mask(p, c, indices_to_remove):
@@ -174,7 +171,18 @@ def main_isolate(mjcf_file):
 
     pcd = pc_to_pcd(pcd_points, pcd_colours)
 
-    return pcd, actuator_colors
+    actuator_colors[">REST<"] = (0,0,0)
+
+    info_json = {">FULL<": {"color": None, "pcd_points": pcd_points.tolist(), "pcd_colours": pcd_colours.tolist()}}
+    for actuator_name, color in actuator_colors.items():
+        mask = np.all(pcd_colours == color, axis=1)
+        info_json[actuator_name] = {
+            "color": list(color),
+            "pcd_points": pcd_points[mask].tolist(),
+            "pcd_indices": np.arange(pcd_points.shape[0])[mask].tolist()
+        }
+
+    return pcd, info_json
 
 
 def mass_main(mjcf_tree, do_visualize, isolate_actuators):
@@ -205,7 +213,7 @@ def main(mjcf_file, outfile, do_visualize, isolate_actuators):
 
     if isolate_actuators:
         json_outfile = outfile.split(".pcd")[0]+".json"
-        jsonstring = json.dumps(actuator_colors).replace(", ", ",\n ")
+        jsonstring = json.dumps(actuator_colors) #.replace(", ", ",\n ")
         with open(json_outfile, "w") as f:
             f.write(jsonstring)
         print(f"Saved actuator colours to {outfile}")
