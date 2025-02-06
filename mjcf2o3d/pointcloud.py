@@ -131,3 +131,4 @@ def pc_cleanup_knn_colours(p, c):
     pcd_points, pcd_colours = pc_mask(pcd_points, pcd_colours, outlier_indices)
 
     pcd = pc_to_pcd(pcd_points, pcd_colours)
+

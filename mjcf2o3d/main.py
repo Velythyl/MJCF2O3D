@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import multiprocessing
 import os
 import shutil
 import sys
@@ -9,7 +10,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from mjcf2o3d.file_utils import get_temp_filename, get_temp_filepath
+from mjcf2o3d.file_utils import get_temp_filename, get_temp_filepath, save_json
 from mjcf2o3d.pointcloud import pc_to_pcd, pc_cleanup_distance_outliers
 from mjcf2o3d.preprocess import preprocess, get_actuator_names, handle_actuator
 from mjcf2o3d.scanner.dm_control_scan import scan
@@ -129,7 +130,8 @@ def main_isolate(mjcf_file, fullscan_gif_file):
     return pc_to_pcd(pcd_points, pcd_colours), info_json, new_image_path
 
 
-def mass_main(mjcf_tree, do_visualize, isolate_actuators, log_file=None):
+
+def mass_main(mjcf_tree, do_visualize, isolate_actuators, log_file=None, refresh=False):
     """
     Traverse a directory tree, find all XML files, and call the `main` function for each XML file.
 
@@ -138,25 +140,36 @@ def mass_main(mjcf_tree, do_visualize, isolate_actuators, log_file=None):
         do_visualize (bool): Whether to visualize the point cloud.
         isolate_actuators (bool): Whether to isolate actuators in the point cloud.
     """
-    # Collect all XML file paths
+    # Collect and filter XML file paths
     xml_files = []
     for root, _, files in os.walk(mjcf_tree):
         for file in files:
             if file.endswith(".xml"):
-                xml_files.append(os.path.join(root, file))
+                xml_path = os.path.join(root, file)
+
+                if file.startswith("mjcf2o3d"):
+                    os.remove(xml_path)
+                    continue
+
+                pcd_path = xml_path.replace(".xml", "-parsed.json")
+                if refresh or (not os.path.exists(pcd_path)):  # Skip if already processed
+                    xml_files.append(xml_path)
 
     if log_file is None:
         log_file = get_temp_filepath(ext=".txt")
 
     # Redirect stdout and stderr to log file
-    log_file = open(log_file, "w")
     print(f"Write mass process log to {log_file}")
+    print()
+    log_file = open(log_file, "w")
 
     # Process files with tqdm progress bar
     pbar = tqdm(xml_files, desc="Processing XML files")
     for mjcf_file in pbar:
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = log_file, log_file
+
+        print(f"\n\n>>> NOW DOING {mjcf_file}\n\n")
 
         outfile = mjcf_file.replace(".xml", "-parsed.pcd")
         pbar.set_postfix_str(mjcf_file)
@@ -165,6 +178,8 @@ def mass_main(mjcf_tree, do_visualize, isolate_actuators, log_file=None):
         except Exception as e:
             sys.stdout, sys.stderr = old_stdout, old_stderr
             raise e
+
+        print(f"\n\n>>> DONE DOING {mjcf_file}\n\n")
 
         sys.stdout, sys.stderr = old_stdout, old_stderr
 
@@ -179,17 +194,9 @@ def main(mjcf_file, outfile, do_visualize, isolate_actuators):
         pcd, new_json_format, temp_image_path = main_isolate(mjcf_file, temp_image_path)
         json_format.update(new_json_format)
 
-
-    # Save the point cloud to the specified outfile
-    o3d.io.write_point_cloud(outfile, pcd)
-    print(f"Saved PCD to {outfile}")
-
-    if isolate_actuators:
-        json_outfile = outfile.split(".pcd")[0]+".json"
-        jsonstring = json.dumps(json_format) #.replace(", ", ",\n ")
-        with open(json_outfile, "w") as f:
-            f.write(jsonstring)
-        print(f"Saved actuator colours to {outfile}")
+    json_outfile = outfile.split(".pcd")[0]+".json"
+    save_json(json_format, json_outfile)
+    print(f"Saved JSON using GZIP to {outfile}")
 
     # Save the image if imagepath is provided
     image_out =  outfile.split(".pcd")[0]+".gif"
@@ -202,11 +209,24 @@ def main(mjcf_file, outfile, do_visualize, isolate_actuators):
 
 
 if __name__ == '__main__':
-    #mass_main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/xmls", do_visualize=False, isolate_actuators=True)
+    #mp_main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/unimals_100", isolate_actuators=True)
     #exit()
 
-    main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/xmls/environments/walker_humanoids_hopper_test/walker_6_main.xml", "./pointcloud.pcd", True, True)
+    mass_main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/unimals_100", do_visualize=False, isolate_actuators=True)
     exit()
+
+    with open("./pointcloud.json", "r") as f:
+        json_loaded = json.load(f)
+    key1 = list(json_loaded.keys())[2]
+    p, c = np.asarray(json_loaded[key1]["pcd_points"]), np.asarray(json_loaded[key1]["pcd_colors"])
+    visualize(pc_to_pcd(p,c))
+    #key2 = json_loaded[list(json_loaded.keys())[1]]
+
+    #mass_main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/unimals_100", do_visualize=True, isolate_actuators=True)
+    exit()
+
+    #main("/home/charlie/Desktop/MJCFConvert/mjcf2o3d/unimals_100/kinematics/xml/mvt-5506-12-6-17-12-20-06_limb_params_3.xml", "./pointcloud.pcd", True, True)
+    #exit()
 
     parser = argparse.ArgumentParser(
         description="Process MJCF file to generate point cloud and optionally save an image.")

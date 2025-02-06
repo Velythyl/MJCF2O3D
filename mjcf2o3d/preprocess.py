@@ -39,8 +39,6 @@ def remove_skylights_skyboxes_floors(mjcf_file, output_file):
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
 
-
-
     # Remove skylights, skyboxes, and floors
     for elem in root.findall(".//light[@name='skylight']"):
         parent = root.find(".//light[@name='skylight']/..")
@@ -69,13 +67,13 @@ def remove_visual_noise(mjcf_file, output_file, rest_of_body_colour):
     root = tree.getroot()
 
     # Find all <include> elements
-    includes = root.findall(".//include")
+    #includes = root.findall(".//include")
 
     # Remove each <include> element
-    for include in includes:
-        parent = include.getparent()
-        if parent is not None:
-            parent.remove(include)
+    #for include in includes:
+    #    parent = include.getparent()
+    #    if parent is not None:
+    #        parent.remove(include)
 
     # Configure visual settings properly
     visual = root.find(".//visual")
@@ -176,11 +174,14 @@ def remove_overlaps(mjcf_file):
         spread_out_bodies(model, data)
 
 
+
 import colorsys
-def identify_actuator(mjcf_file, output_file, isolate_actuator_names, removed_actuator_colour, kept_actuator_colour):
+def identify_actuator(mjcf_file, output_file, isolate_actuator_names, removed_actuator_colour, kept_actuator_colour, cache_name="temp"):
     # Parse the MJCF file
     tree = etree.parse(mjcf_file)
     root = tree.getroot()
+
+    # <CACHE>
 
     # Find all actuator elements
     actuator_elements = root.findall(".//actuator/*")
@@ -196,6 +197,7 @@ def identify_actuator(mjcf_file, output_file, isolate_actuator_names, removed_ac
         return
 
     # Helper to calculate body depth in hierarchy
+
     def get_body_depth(body_element):
         depth = 0
         current = body_element.getparent()
@@ -232,6 +234,8 @@ def identify_actuator(mjcf_file, output_file, isolate_actuator_names, removed_ac
 
         depth = get_body_depth(body)
         actuator_info.append((depth, actuator_name, joint_name, geoms))
+
+    # </CACHE>
 
     # Sort by depth (shallowest first) to process parent bodies first
     actuator_info.sort(key=lambda x: x[0])
@@ -517,6 +521,6 @@ def handle_actuator(workfile, actuator_names, rest_of_body_colour="t", removed_a
     remove_visual_noise(workfile, file_no_objects, rest_of_body_colour)
 
     identified_actuators = get_temp_filepath()
-    actuator_colours = identify_actuator(file_no_objects, identified_actuators, actuator_names, removed_actuator_colour, kept_actuator_colour)
+    actuator_colours = identify_actuator(file_no_objects, identified_actuators, actuator_names, removed_actuator_colour, kept_actuator_colour, cache_name=workfile)
 
     return identified_actuators, actuator_colours
